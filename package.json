@@ -1,0 +1,18 @@
+{
+  "name": "hybrid-pq-blockchain-thesis",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Classical vs Hybrid Post-Quantum Blockchain comparative prototype (Master's thesis)",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=@thesis/shared && npm run build --workspace=@thesis/classical-node && npm run build --workspace=@thesis/hybrid-node",
+    "test": "npm run test --workspaces --if-present",
+    "classical:dev": "npm run dev --workspace=@thesis/classical-node",
+    "hybrid:dev": "npm run dev --workspace=@thesis/hybrid-node"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

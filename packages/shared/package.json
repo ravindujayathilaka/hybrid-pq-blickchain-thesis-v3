@@ -1,0 +1,23 @@
+{
+  "name": "@thesis/shared",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Shared blockchain core: block, chain, wallet, transaction pool, and pluggable signature providers",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --experimental-vm-modules ../../node_modules/.bin/jest"
+  },
+  "dependencies": {
+    "@noble/curves": "2.2.0",
+    "@noble/hashes": "2.2.0",
+    "@noble/post-quantum": "0.6.1"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "jest": "30.4.2",
+    "ts-jest": "29.4.11",
+    "@types/jest": "30.0.0"
+  }
+}
