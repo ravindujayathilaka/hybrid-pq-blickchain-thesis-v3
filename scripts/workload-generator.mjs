@@ -91,7 +91,13 @@ async function createWallet(baseUrl) {
 }
 
 async function mine(baseUrl, minerAddress) {
-  const { body } = await postJson(`${baseUrl}/mine`, { minerAddress }, { timeoutMs: 60000, retries: 1 });
+  // The workload only needs the block timestamp for interval metrics. Avoid
+  // returning every large hybrid transaction/signature in the HTTP response.
+  const { body } = await postJson(
+    `${baseUrl}/mine`,
+    { minerAddress, summaryOnly: true },
+    { timeoutMs: 60000, retries: 1 }
+  );
   return body;
 }
 

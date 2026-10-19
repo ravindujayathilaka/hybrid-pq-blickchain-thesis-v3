@@ -37,6 +37,23 @@ interface PendingSync {
   peerLabel: string;
 }
 
+interface ChainRequestPayload {
+  /** Array index of the first block the requester is missing. */
+  fromIndex?: number;
+}
+
+interface ChainResponseChunk {
+  startIndex: number;
+  totalLength: number;
+  blocks: SerializedBlock[];
+  hasMore: boolean;
+}
+
+// Hybrid blocks are substantially larger than classical blocks because each
+// transaction includes ML-DSA key/signature material. Keep each sync packet
+// bounded instead of trying to send the full chain as one Socket.IO message.
+const CHAIN_SYNC_BATCH_SIZE = 5;
+
 export interface PeerManager {
   /** Opens outbound connections to every configured peer. Call once at startup. */
   connectToPeers(): void;
@@ -153,10 +170,47 @@ export function createPeerManager(
     metrics.recordBlock(blockRecord);
   }
 
+  function requestChainChunk(socket: ClientSocket | ServerSocket) {
+    socket.emit('chain:request', { fromIndex: chain.chain.length } satisfies ChainRequestPayload);
+    messagesSent++;
+  }
+
+  function finishSync(socket: ClientSocket | ServerSocket) {
+    const pending = pendingSyncs.get(socket);
+    pendingSyncs.delete(socket);
+    if (!pending) return;
+
+    const completedAt = Date.now();
+    const chainLengthAfter = chain.chain.length;
+    if (chainLengthAfter > pending.chainLengthBefore) {
+      logger.info('resynced chain from peer', { newLength: chainLengthAfter });
+      if (metrics && blockchainType) {
+        metrics.recordSyncEvent({
+          blockchainType,
+          nodeId: nodeLabel,
+          peerUrl: pending.peerLabel,
+          triggeredAt: pending.triggeredAt,
+          completedAt,
+          syncDurationMs: completedAt - pending.triggeredAt,
+          chainLengthBefore: pending.chainLengthBefore,
+          chainLengthAfter,
+        });
+      }
+    }
+  }
+
   function handleIncomingBlock(payload: BlockAnnouncePayload, respondTo: ClientSocket | ServerSocket) {
     messagesReceived++;
     const receivedAt = Date.now();
-    if (seenBlockHashes.has(payload.block.hash)) return; // duplicate delivery, already processed
+    const blockIndex = payload.block.index;
+
+    // Ignore blocks already present in our chain. Do not ignore a previously
+    // observed future block solely because it is in seenBlockHashes: that block
+    // may have arrived out of order and still need to be fetched during sync.
+    if (blockIndex < chain.chain.length) {
+      rememberSeen(payload.block.hash);
+      return;
+    }
     rememberSeen(payload.block.hash);
 
     const block = Block.fromJSON(payload.block);
@@ -198,11 +252,17 @@ export function createPeerManager(
       }
       broadcastBlock(block); // gossip onward; seenBlockHashes prevents storms
     } else if (result.reason === 'NOT_NEXT_INDEX') {
-      logger.warn('behind peer by >1 block, requesting full chain resync', { from: payload.fromNode });
-      const peerLabel = peerLabelBySocket.get(respondTo) ?? 'unknown-peer';
-      pendingSyncs.set(respondTo, { triggeredAt: Date.now(), chainLengthBefore: chain.chain.length, peerLabel });
-      respondTo.emit('chain:request');
-      messagesSent++;
+      logger.warn('behind peer, requesting chunked chain resync', { from: payload.fromNode, requestedFromIndex: chain.chain.length });
+      // Avoid issuing a new request for every out-of-order announce while the
+      // current peer is already supplying missing blocks in bounded chunks.
+      if (!pendingSyncs.has(respondTo)) {
+        pendingSyncs.set(respondTo, {
+          triggeredAt: Date.now(),
+          chainLengthBefore: chain.chain.length,
+          peerLabel: peerLabelBySocket.get(respondTo) ?? 'unknown-peer',
+        });
+        requestChainChunk(respondTo);
+      }
     } else {
       logger.warn('rejected block from peer', { index: block.index, from: payload.fromNode, reason: result.reason });
     }
@@ -211,35 +271,91 @@ export function createPeerManager(
   function wireCommonHandlers(socket: ClientSocket | ServerSocket) {
     socket.on('block:announce', (payload: BlockAnnouncePayload) => handleIncomingBlock(payload, socket));
 
-    socket.on('chain:request', () => {
+    socket.on('chain:request', (request?: ChainRequestPayload) => {
       messagesReceived++;
-      socket.emit('chain:response', chain.chain.map((b) => b.toJSON()));
+      const requestedIndex = Number.isSafeInteger(request?.fromIndex)
+        ? Math.max(0, request!.fromIndex as number)
+        : 0;
+      const startIndex = Math.min(requestedIndex, chain.chain.length);
+      const endIndex = Math.min(startIndex + CHAIN_SYNC_BATCH_SIZE, chain.chain.length);
+      const blocks = chain.chain.slice(startIndex, endIndex).map((b) => b.toJSON());
+      const response: ChainResponseChunk = {
+        startIndex,
+        totalLength: chain.chain.length,
+        blocks,
+        hasMore: endIndex < chain.chain.length,
+      };
+      totalBytesSent += Buffer.byteLength(JSON.stringify(blocks));
+      socket.emit('chain:response', response);
       messagesSent++;
     });
 
-    socket.on('chain:response', (chainJson: SerializedBlock[]) => {
+    socket.on('chain:response', (response: ChainResponseChunk | SerializedBlock[]) => {
       messagesReceived++;
-      const incoming = chainJson.map((b) => Block.fromJSON(b));
-      const result = chain.replaceChain(incoming);
-      const pending = pendingSyncs.get(socket);
-      pendingSyncs.delete(socket);
 
-      if (result.replaced) {
-        logger.info('resynced full chain from peer', { newLength: incoming.length });
-        if (pending && metrics && blockchainType) {
-          const completedAt = Date.now();
-          metrics.recordSyncEvent({
-            blockchainType,
-            nodeId: nodeLabel,
-            peerUrl: pending.peerLabel,
-            triggeredAt: pending.triggeredAt,
-            completedAt,
-            syncDurationMs: completedAt - pending.triggeredAt,
-            chainLengthBefore: pending.chainLengthBefore,
-            chainLengthAfter: incoming.length,
-          });
+      // Backward compatibility with an older node version that responds with
+      // one full-chain array. New nodes always use bounded chunk responses.
+      if (Array.isArray(response)) {
+        const incoming = response.map((b) => Block.fromJSON(b));
+        const result = chain.replaceChain(incoming);
+        if (result.replaced) {
+          for (const block of incoming) rememberSeen(block.hash);
+          finishSync(socket);
+        } else {
+          pendingSyncs.delete(socket);
         }
+        return;
       }
+
+      if (!response || !Array.isArray(response.blocks)) {
+        logger.warn('received malformed chain sync response');
+        pendingSyncs.delete(socket);
+        return;
+      }
+
+      totalBytesReceived += Buffer.byteLength(JSON.stringify(response.blocks));
+      let failed = false;
+      for (const serializedBlock of response.blocks) {
+        // Another peer may have delivered a block while this sync response was
+        // in flight. Skip it if already appended, but never append across a gap.
+        if (serializedBlock.index < chain.chain.length) {
+          rememberSeen(serializedBlock.hash);
+          continue;
+        }
+        if (serializedBlock.index !== chain.chain.length) {
+          logger.warn('chain sync chunk has a gap', {
+            expectedIndex: chain.chain.length,
+            receivedIndex: serializedBlock.index,
+          });
+          failed = true;
+          break;
+        }
+
+        const block = Block.fromJSON(serializedBlock);
+        const appendResult = chain.appendReceivedBlock(block);
+        if (!appendResult.accepted) {
+          logger.warn('chain sync block rejected', {
+            index: block.index,
+            reason: appendResult.reason,
+          });
+          failed = true;
+          break;
+        }
+        rememberSeen(block.hash);
+      }
+
+      if (failed) {
+        pendingSyncs.delete(socket);
+        return;
+      }
+
+      const stillBehind = response.hasMore || response.totalLength > chain.chain.length;
+      if (stillBehind && response.blocks.length > 0) {
+        requestChainChunk(socket);
+        return;
+      }
+
+      finishSync(socket);
     });
   }
 

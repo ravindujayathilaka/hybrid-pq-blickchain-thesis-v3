@@ -214,7 +214,7 @@ export function buildServer(
   });
 
   app.post('/mine', (req: Request, res: Response) => {
-    const { minerAddress } = req.body ?? {};
+    const { minerAddress, summaryOnly } = req.body ?? {};
     if (typeof minerAddress !== 'string') {
       return res.status(400).json({ error: 'minerAddress (string) is required' });
     }
@@ -295,10 +295,32 @@ export function buildServer(
       metrics.recordBlock(blockRecord);
     }
 
-    io.emit('chain:update', chain.chain.map((b) => b.toJSON()));
-    peerManager.broadcastBlock(result.block); // propagate to the P2P network
+    // Do not serialize and broadcast the entire chain after every block.
+    // Hybrid transactions contain large ML-DSA keys/signatures, so repeatedly
+    // shipping the full history causes quadratic network/serialization growth
+    // and eventually exceeds Socket.IO's message-size limits. Clients that
+    // need full history can fetch GET /chain explicitly.
+    io.emit('chain:update', {
+      length: chain.chain.length,
+      latestBlock: {
+        index: result.block.index,
+        timestamp: result.block.timestamp,
+        hash: result.block.hash,
+        previousHash: result.block.previousHash,
+        transactionCount: result.block.transactions.length,
+      },
+    });
+    peerManager.broadcastBlock(result.block); // propagate the full new block to P2P peers
     res.status(201).json({
-      block: result.block.toJSON(),
+      block: summaryOnly === true
+        ? {
+            index: result.block.index,
+            timestamp: result.block.timestamp,
+            hash: result.block.hash,
+            previousHash: result.block.previousHash,
+            transactionCount: result.block.transactions.length,
+          }
+        : result.block.toJSON(),
       durationMs: result.durationMs,
       attempts: result.attempts,
       transactionCount: result.transactionCount,

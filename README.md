@@ -124,8 +124,20 @@ Environment variables (both nodes): `PORT`, `DIFFICULTY` (PoW leading-zero count
 | `POST` | `/mine` | Mines all pending transactions into a new block; returns timing data |
 
 `POST /mine` and the mining pipeline return `durationMs` and `attempts` directly — these are the
-raw measurements the benchmark module (next phase) will aggregate into TPS, mining-time, and
-verification-time comparisons between System A and System B.
+raw measurements the benchmark module aggregates into TPS, mining-time, and verification-time
+comparisons between System A and System B. Benchmark clients can pass `summaryOnly: true` in the
+`/mine` request body to receive only the block index, timestamp, hash, previous hash, and transaction
+count instead of downloading the entire transaction payload. The workload generator uses this mode.
+
+### Large-workload networking safeguards
+
+- The Socket.IO `chain:update` event now sends the chain length and latest-block summary, not the
+  complete chain after every mined block. Clients that need the full history should request `GET /chain`.
+- Peer catch-up uses bounded five-block `chain:response` chunks and validates/appends each block in
+  sequence. It no longer serializes the full chain into one message, which could exceed Socket.IO's
+  default message limit with ML-DSA-sized hybrid transactions.
+- These changes keep the benchmark's measured blockchain and signature behaviour intact while
+  avoiding repeated full-history serialization and transfer as the chain grows.
 
 ## What's implemented vs. what's next
 
