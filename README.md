@@ -138,6 +138,11 @@ count instead of downloading the entire transaction payload. The workload genera
   default message limit with ML-DSA-sized hybrid transactions.
 - These changes keep the benchmark's measured blockchain and signature behaviour intact while
   avoiding repeated full-history serialization and transfer as the chain grows.
+- Network startup first stops stale node processes that belong to this project, checks that all
+  six ports are free, and waits until every expected node answers `/health` before a workload starts.
+  It never kills an unrelated process that is holding one of those ports. The experiment runner
+  also stops the network on errors or interruption, preventing orphan hybrid nodes from causing
+  `EADDRINUSE` on ports 4012/4022 during the next 50,000-transaction run.
 
 ## What's implemented vs. what's next
 

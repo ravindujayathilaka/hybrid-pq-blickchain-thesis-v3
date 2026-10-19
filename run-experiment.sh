@@ -17,9 +17,25 @@
 #
 # Env overrides: DIFFICULTY (default 4), SAMPLE_INTERVAL_MS (default 1000)
 
-set -e
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+set -Eeuo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 cd "$ROOT"
+
+# Always stop the local nodes on normal completion, Ctrl-C, or a failed
+# workload/analysis command. Without this trap, the next run can inherit
+# orphan nodes whose ports are then reported as EADDRINUSE.
+cleanup_network() {
+  local status=$?
+  trap - EXIT
+  if [[ -f "$ROOT/.network-pids" ]]; then
+    echo "Cleaning up network processes after experiment (exit status $status)."
+    "$ROOT/stop-network.sh" || true
+  fi
+  exit "$status"
+}
+trap cleanup_network EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 COUNT="${1:-1000}"
 CONCURRENCY="${2:-10}"
